@@ -4,11 +4,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
+	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/terraform/config/configschema"
 	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/configs/configload"
+	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
 )
 
 // normalizePath normalizes a given path so that it is, if possible, relative
@@ -80,6 +85,23 @@ func (m *Meta) loadSingleModule(dir string) (*configs.Module, tfdiags.Diagnostic
 	return module, diags
 }
 
+// dirIsConfigPath checks if the given path is a directory that contains at
+// least one Terraform configuration file (.tf or .tf.json), returning true
+// if so.
+//
+// In the unlikely event that the underlying config loader cannot be initalized,
+// this function optimistically returns true, assuming that the caller will
+// then do some other operation that requires the config loader and get an
+// error at that point.
+func (m *Meta) dirIsConfigPath(dir string) bool {
+	loader, err := m.initConfigLoader()
+	if err != nil {
+		return true
+	}
+
+	return loader.IsConfigDir(dir)
+}
+
 // loadBackendConfig reads configuration from the given directory and returns
 // the backend configuration defined by that module, if any. Nil is returned
 // if the specified module does not have an explicit backend configuration.
@@ -97,6 +119,41 @@ func (m *Meta) loadSingleModule(dir string) (*configs.Module, tfdiags.Diagnostic
 func (m *Meta) loadBackendConfig(rootDir string) (*configs.Backend, tfdiags.Diagnostics) {
 	mod, diags := m.loadSingleModule(rootDir)
 	return mod.Backend, diags
+}
+
+// loadValuesFile loads a file that defines a single map of key/value pairs.
+// This is the format used for "tfvars" files.
+func (m *Meta) loadValuesFile(filename string) (map[string]cty.Value, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+	filename = m.normalizePath(filename)
+
+	loader, err := m.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(err)
+		return nil, diags
+	}
+
+	vals, hclDiags := loader.Parser().LoadValuesFile(filename)
+	diags = diags.Append(hclDiags)
+	return vals, diags
+}
+
+// loadHCLFile reads an arbitrary HCL file and returns the unprocessed body
+// representing its toplevel. Most callers should use one of the more
+// specialized "load..." methods to get a higher-level representation.
+func (m *Meta) loadHCLFile(filename string) (hcl.Body, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+	rootDir = m.normalizePath(filename)
+
+	loader, err := m.initConfigLoader()
+	if err != nil {
+		diags = diags.Append(err)
+		return nil, diags
+	}
+
+	body, hclDiags := loader.Parser().LoadHCLFile(filename)
+	diags = diags.Append(hclDiags)
+	return body, diags
 }
 
 // installModules reads a root module from the given directory and attempts
@@ -170,6 +227,67 @@ func (m *Meta) loadVarsFile(filename string) (map[string]cty.Value, tfdiags.Diag
 	ret, hclDiags := parser.LoadValuesFile(filename)
 	diags = diags.Append(hclDiags)
 	return ret, diags
+}
+
+// inputForSchema uses interactive prompts to try to populate any
+// not-yet-populated required attributes in the given object value to
+// comply with the given schema.
+//
+// An error will be returned if input is disabled for this meta or if
+// values cannot be obtained for some other operational reason. Errors are
+// not returned for invalid input since the input loop itself will report
+// that interactively.
+//
+// It is not guaranteed that the result will be valid, since certain attribute
+// types and nested blocks are not supported for input.
+//
+// The given value must conform to the given schema. If not, this method will
+// panic.
+func (m *Meta) inputForSchema(given cty.Value, schema *configschema.Block) (cty.Value, error) {
+	if given.IsNull() || !given.IsKnown() {
+		// This is not reasonable input, but we'll tolerate it anyway and
+		// just pass it through for the caller to handle downstream.
+		return given, nil
+	}
+
+	givenVals := given.AsValueMap()
+	retVals := make(map[string]cty.Value, len(givenVals))
+	names := make([]string, 0, len(schema.Attributes))
+	for name, attrS := range schema.Attributes {
+		retVals[name] = givenVals[name]
+		if givenVal := givenVals[name]; attrS.Required && givenVal.IsNull() && attrS.Type.IsPrimitiveType() {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	input := m.UIInput()
+	for _, name := range names {
+		attrS := schema.Attributes[name]
+
+		for {
+			strVal, err := input.Input(&terraform.InputOpts{
+				Id:          name,
+				Query:       name,
+				Description: attrS.Description,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("%s: %s", name, err)
+			}
+
+			val := cty.StringVal(strVal)
+			val, err = convert.Convert(val, attrS.Type)
+			if err != nil {
+				m.showDiagnostics(fmt.Errorf("Invalid value: %s", err))
+				continue
+			}
+
+			retVals[name] = val
+			break
+		}
+	}
+
+	return cty.ObjectVal(retVals), nil
 }
 
 // configSources returns the source cache from the receiver's config loader,
